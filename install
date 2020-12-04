@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+
+#
+# CONFIGURATION
+#
+
+# Go to script dir
+cd "$(dirname "$(readlink -f "$0")")"
+
+# Load configuration
+source ./hyper.conf
+
+#
+# FUNCTIONS
+#
+
+# utilities
+title(){ echo "$@" | tee -a "${logfile}" | grep '^.*$' --color; }
+shout(){ echo "$0: $*" >&2; }
+die(){ shout "${@:2} ($1)"; exit $1; }
+try(){ "$@" 2>/dev/null || die $? "cannot $*"; }
+
+# interactive setup
+yesno() {
+    if ${yestoall}; then
+        echo "$1"
+        return 0
+    else
+        read -p "$1? [y/N] " answer
+        if [[ "${answer}" =~ ^(y|Y|o|O).* ]]; then 
+            return 0
+        else
+            return 1
+        fi
+    fi
+}
+
+# package manager
+pkg(){
+    [[ "$#" == '0' ]] && return 1
+    DEBIAN_FRONTEND=noninteractive apt-get -qqy "${@}" &>>"${logfile}"
+    [[ "$1" == "purge" ]] && apt-get -qqy auto-remove &>>"${logfile}"
+}
+
+#
+# MAIN
+#
+
+# Reboot required
+reboot=false
+
+# Test root
+if [[ "$(whoami)" != "root" ]]; then
+    die 1 "need root rights"
+fi
+
+# Test user
+if ! grep -q "${user}" /etc/passwd; then
+    if [[ "$(hostname)" = 'raspberry' ]]; then
+        shout "user ${user} missing. To add it:"
+        echo
+        echo '1. Configure a password for root'
+        echo '   $ sudo passwd root'
+        echo '   $ exit'
+        echo
+        echo '2. Log in as root and rename pi user'
+        echo "   # usermod -l ${user} pi"
+        echo "   # usermod -m -d /home/${user} ${user}"
+        echo '   # exit'
+        echo
+        echo "3. Log in as ${user} and disable root password"
+        echo '   $ sudo passwd -l root'
+        echo
+        exit 1
+    else
+        die 1 "user ${user} missing"
+    fi
+fi
+
+# yes to all
+if [[ "$1" == '--yes' ]]; then
+    yestoall=true
+fi
+
+if ! ${yestoall}; then
+    title 'summary'
+    echo "username  ${user}"
+    echo "hostname  ${hostname}"
+    echo "network   ${ipaddr}"
+    echo "tmp size  ${tmpsize}"
+    echo "log size  ${logsize}"
+    echo "bridge    ${bridge}"
+    if ${lxclvm}; then 
+        echo "lvm       vg=${vgname} lv=${lvname} pool=${poolname}"
+    fi
+    if ! yesno 'continue'; then
+        exit 0
+    fi
+fi
+
+if [[ "$(hostname)" == 'raspberry' ]]; then
+    title 'raspberry'
+    if yesno '* clean useless packages'; then
+        pkg purge triggerhappy alsa-utils bluez bluez-firmware dhcpcd5 wireless-regdb wireless-tools wpasupplicant avahi-daemon rng-tools
+        rm -rf /var/run/avahi-daemon /etc/wpa_supplicant
+    fi
+    if yesno '* enable ssh server'; then
+        systemctl enable --now ssh &>/dev/null
+    fi
+fi
+
+title 'system'
+if yesno '* update system packages'; then
+    pkg update
+    pkg upgrade
+fi
+
+if yesno '* install system tools (htop, vim, etc.)'; then
+    pkg update
+    pkg install sudo bash-completion vim git htop rsync lvm2 net-tools iptables iptables-persistent dnsutils wget gpg lsb-release
+fi
+
+if yesno "* replace hostname: ${hostname}"; then
+    sed "s,$(hostname),${hostname},g" -i /etc/hosts /etc/hostname
+fi
+
+if yesno "* add ${user} to sudoers"; then
+    usermod -aG sudo "${user}"
+fi
+
+if yesno "* configure /tmp to ram"; then
+    echo "# /tmp" >> /etc/fstab
+    echo "tmpfs   		 		 /tmp      tmpfs   rw,nodev,nosuid,size=${tmpsize}    0  	0" >> /etc/fstab
+    mount /tmp
+fi
+
+if yesno "* configure logs to ram"; then
+    echo "deb http://packages.azlux.fr/debian/ buster main" > /etc/apt/sources.list.d/azlux.list
+    wget -qO - https://azlux.fr/repo.gpg.key | apt-key add - &>/dev/null
+    pkg update
+    pkg install log2ram
+    sed "s,^SIZE=.*,SIZE=${logsize},g" -i /etc/log2ram.conf
+    rm /etc/apt/sources.list.d/azlux.list
+    pkg update
+    reboot=true
+fi
+
+if yesno "* install dynamic motd"; then
+    git clone --depth 1 https://github.com/bderenzo/dmotd.git "${srcdir}/motd" &>>"${logfile}"
+    "${srcdir}/motd/install" -u "${user}" &>>"${logfile}"
+    echo "Please read documentation: https://github.com/bderenzo/dmotd"
+fi
+
+title 'network'
+if [[ ${bridge} != 'lxcbr0' ]]; then
+    interface="$(ls /sys/class/net/ | grep -vE 'lo|br|veth|wlan')"
+    if yesno "* configure host network: ${interface} in ${bridge}"; then
+        sed -e "s,<interface>,${interface},g" \
+            -e "s,<bridge>,${bridge},g" \
+            -e "s,<ip>,${ipaddr},g" \
+            -e "s,<gateway>,${ipaddr%.*}.1,g" \
+            ./resources/vm-net > /etc/network/interfaces
+        reboot=true
+    fi
+fi
+
+title 'lxc'
+if yesno '* install and configure lxc'; then
+    pkg install lxc lxcfs bridge-utils
+    pkg purge lxc-templates
+
+    # root own unprivileged container
+    usermod --add-subuids 100000-165536 root
+    usermod --add-subgids 100000-165536 root
+    # root unprivileged mapped user
+    groupadd root-ct -g 100000
+    useradd  root-ct -u 100000 -g 100000 --system --shell /usr/sbin/nologin --home-dir /nonexistent
+
+    # lxc network config
+    cat ./resources/lxc-default.conf > /etc/lxc/default.conf
+    sed "/lxc.net.0.link =/s/=.*$/= ${bridge}/g" -i /etc/lxc/default.conf
+
+    # iptables filtering (integrated fw)
+    echo 'br_netfilter' >>  /etc/modules-load.d/modules.conf
+    echo 'net.bridge.bridge-nf-call-iptables = 1' > /etc/sysctl.d/40-bridge-filtering.conf
+
+    # lxcbr0 config
+    if [[ "${bridge}" == 'lxcbr0' ]]; then
+        cat ./resources/lxc-net > /etc/default/lxc-net
+        touch /etc/lxc/dhcp.conf
+    fi
+    systemctl restart lxc-net lxc
+fi
+
+if ${lxclvm}; then
+    if yesno '* configure lxc lvm disk'; then
+        echo "avalaible disk:"
+        lsblk -pno KNAME,SIZE
+        read -p  'select disk: ' disk
+        echo "WARNING: the following disk will be erased: ${disk}"
+        if yesno 'erase the above disk and continue'; then
+            pvcreate "${disk}" &>>"${logfile}"
+            vgcreate "${vgname}" "${disk}" &>>"${logfile}"
+            lvcreate --type thin-pool --thinpool "${poolname}" -l 100%FREE "${lvname}" &>>"${logfile}"
+        else
+            echo 'aborted'
+        fi
+    fi
+fi
+
+if yesno '* install lxc manager'; then
+    git clone --depth 1 https://github.com/bderenzo/lxm.git "${srcdir}/lxm" &>>"${logfile}"
+    "${srcdir}/lxm/install" &>>"${logfile}"
+    userhomedir="$(getent passwd "${user}" | cut -d: -f6)"
+    echo "# lxc manager aliases" >> "${userhomedir}/.bashrc"
+    echo "alias lxm='sudo lxm'"  >> "${userhomedir}/.bashrc"
+    echo "alias fw='sudo fw'"    >> "${userhomedir}/.bashrc"
+    echo "Please read documentation: https://github.com/bderenzo/lxm"
+fi
+
+if ${reboot}; then
+    title 'lxc'
+    echo "WARNING: a reboot is required to finalize configuration"
+    if yesno 'reboot now'; then
+        reboot
+    fi
+fi
+
