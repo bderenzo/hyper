@@ -148,7 +148,7 @@ fi
 if yesno "* install dynamic motd"; then
     git clone --depth 1 https://github.com/bderenzo/dmotd.git "${srcdir}/motd" &>>"${logfile}"
     "${srcdir}/motd/install" -u "${user}" &>>"${logfile}"
-    echo "Please read documentation: https://github.com/bderenzo/dmotd"
+    echo "Please read dmotd documentation: https://github.com/bderenzo/dmotd"
 fi
 
 title 'network'
@@ -208,18 +208,18 @@ if ${lxclvm}; then
     fi
 fi
 
-if yesno '* install lxc manager'; then
+if yesno '* install lxm (lxc manager)'; then
     git clone --depth 1 https://github.com/bderenzo/lxm.git "${srcdir}/lxm" &>>"${logfile}"
     "${srcdir}/lxm/install" &>>"${logfile}"
     userhomedir="$(getent passwd "${user}" | cut -d: -f6)"
     echo "# lxc manager aliases" >> "${userhomedir}/.bashrc"
     echo "alias lxm='sudo lxm'"  >> "${userhomedir}/.bashrc"
     echo "alias fw='sudo fw'"    >> "${userhomedir}/.bashrc"
-    echo "Please read documentation: https://github.com/bderenzo/lxm"
+    echo "Please read lxm documentation: https://github.com/bderenzo/lxm"
 fi
 
 if ${reboot}; then
-    title 'lxc'
+    echo
     echo "WARNING: a reboot is required to finalize configuration"
     if yesno 'reboot now'; then
         reboot
