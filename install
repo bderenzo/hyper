@@ -56,7 +56,7 @@ fi
 
 # Test user
 if ! grep -q "${user}" /etc/passwd; then
-    if [[ "$(hostname)" = 'raspberry' ]]; then
+    if [[ "$(hostname)" = 'raspberrypi' ]]; then
         shout "user ${user} missing. To add it:"
         echo
         echo '1. Configure a password for root'
@@ -98,11 +98,15 @@ if ! ${yestoall}; then
     fi
 fi
 
-if [[ "$(hostname)" == 'raspberry' ]]; then
+if [[ "$(hostname)" == 'raspberrypi' ]]; then
     title 'raspberry'
-    if yesno '* clean useless packages'; then
-        pkg purge triggerhappy alsa-utils bluez bluez-firmware dhcpcd5 wireless-regdb wireless-tools wpasupplicant avahi-daemon rng-tools
-        rm -rf /var/run/avahi-daemon /etc/wpa_supplicant
+    if yesno '* purge useless packages (bluetooth, etc.)'; then
+        pkg purge triggerhappy alsa-utils bluez bluez-firmware avahi-daemon rng-tools raspi-config
+        rm -rf /var/run/avahi-daemon
+    fi
+    if yesno '* purge wifi packages'; then
+        pkg purge dhcpcd5 wireless-regdb wireless-tools wpasupplicant
+        rm -rf /etc/wpa_supplicant
     fi
     if yesno '* enable ssh server'; then
         systemctl enable --now ssh &>/dev/null
